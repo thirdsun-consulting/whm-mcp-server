@@ -1,6 +1,6 @@
 {
   "name": "whm-mcp-server",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "MCP server for the WHM (WebHost Manager) API 1 — server-level cPanel administration: accounts, domains, DNS, email, packages, SSL/AutoSSL, backups, resellers, cPHulk, PHP, logs",
   "type": "module",
   "main": "dist/index.js",
@@ -13,13 +13,21 @@
     "build": "tsc && chmod +x dist/index.js",
     "clean": "rm -rf dist",
     "inspect": "npx @modelcontextprotocol/inspector node dist/index.js",
+    "bundle": "node scripts/bundle.mjs",
+    "test": "node scripts/test-offline.mjs",
     "verify:spec": "node scripts/verify-spec.mjs",
     "verify:http": "node scripts/verify-http.mjs"
   },
   "engines": {
     "node": ">=18"
   },
-  "keywords": ["mcp", "whm", "cpanel", "anthropic", "claude"],
+  "keywords": [
+    "mcp",
+    "whm",
+    "cpanel",
+    "anthropic",
+    "claude"
+  ],
   "license": "MIT",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.6.1",
@@ -28,6 +36,7 @@
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
+    "esbuild": "0.28.2",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2"
   }

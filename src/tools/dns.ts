@@ -285,6 +285,32 @@ const SerialSchema = z
   .optional()
   .describe("Expected zone serial (from whm_get_dns_zone). The edit fails if the zone changed since. Default: current serial");
 
+/**
+ * line_index values are positions in the zone file, so they shift whenever a
+ * record is added or removed. Tools that take a line_index therefore need the
+ * serial of the listing it came from; defaulting to the current serial would
+ * let a stale line_index silently hit a different record.
+ */
+const ListingSerialSchema = z
+  .number()
+  .int()
+  .describe(
+    "The zone serial from the whm_get_dns_zone call that gave you this line_index. " +
+      "The call is refused if the zone has changed since, because line_index values shift with every change."
+  );
+
+const RELIST_NOTE =
+  "The zone's line_index values have changed: run whm_get_dns_zone again before editing or removing other records.";
+
+function assertListingCurrent(domain: string, expected: number, current: number | undefined): void {
+  if (current !== expected) {
+    throw new ToolInputError(
+      `${domain} has changed since that listing (its serial is now ${current ?? "unknown"}, not ${expected}), ` +
+        "so line_index values may point at different records. Run whm_get_dns_zone again and use its line_index and serial."
+    );
+  }
+}
+
 export function registerDnsTools(server: ToolRegistrar) {
   server.registerTool(
     "whm_list_dns_zones",
@@ -318,7 +344,7 @@ export function registerDnsTools(server: ToolRegistrar) {
       title: "Get DNS Zone",
       description:
         "Get a domain's DNS records with each record's line_index and the zone's SOA serial. " +
-        "Pass line_index to whm_edit_dns_record / whm_remove_dns_record.",
+        "Pass line_index together with that serial to whm_edit_dns_record / whm_remove_dns_record / whm_mass_edit_dns_zone.",
       inputSchema: {
         domain: z.string(),
         type: z.string().optional().describe("Only records of this type, e.g. 'MX' or 'TXT'"),
@@ -439,7 +465,7 @@ export function registerDnsTools(server: ToolRegistrar) {
         const newSerial = await massEditZone(params.domain, serial, { add: [record] });
         return formatResponse(
           params.response_format,
-          `Added to ${params.domain}: ${fmtRecord({ name: record.dname, ttl: record.ttl, type: record.record_type, data: record.data })} (new serial ${newSerial ?? "n/a"}).`,
+          `Added to ${params.domain}: ${fmtRecord({ name: record.dname, ttl: record.ttl, type: record.record_type, data: record.data })} (new serial ${newSerial ?? "n/a"}).\n${RELIST_NOTE}`,
           { domain: params.domain, added: record, new_serial: newSerial }
         );
       } catch (e) {
@@ -453,8 +479,8 @@ export function registerDnsTools(server: ToolRegistrar) {
     {
       title: "Edit DNS Record",
       description:
-        "Edit the record at a line_index from whm_get_dns_zone. Only the fields you pass change (e.g. just 'preference' of an MX record); " +
-        "the rest are kept from the current record. Confirm with user.",
+        "Edit the record at a line_index from whm_get_dns_zone, passing the serial from that same listing. " +
+        "Only the fields you pass change (e.g. just 'preference' of an MX record); the rest are kept from the current record. Confirm with user.",
       inputSchema: {
         domain: z.string(),
         line_index: z.number().int().min(0).describe("The record's line_index from whm_get_dns_zone"),
@@ -462,7 +488,7 @@ export function registerDnsTools(server: ToolRegistrar) {
         type: RecordTypeSchema.optional(),
         ttl: z.number().int().min(0).optional(),
         ...RecordFieldsSchema,
-        serial: SerialSchema,
+        serial: ListingSerialSchema,
         ...FormatSchema,
       },
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
@@ -470,6 +496,7 @@ export function registerDnsTools(server: ToolRegistrar) {
     async (params) => {
       try {
         const zone = await fetchZone(params.domain);
+        assertListingCurrent(params.domain, params.serial, zone.serial);
         const existing = zone.records.find((r) => r.line_index === params.line_index);
         if (!existing) {
           return err(`No record starts at line_index ${params.line_index} in ${params.domain}. Run whm_get_dns_zone to find it.`);
@@ -493,11 +520,11 @@ export function registerDnsTools(server: ToolRegistrar) {
           record_type: type,
           data,
         };
-        const newSerial = await massEditZone(params.domain, params.serial ?? zone.serial, { edit: [record] });
+        const newSerial = await massEditZone(params.domain, params.serial, { edit: [record] });
         const after = { name: record.dname, ttl: record.ttl, type: record.record_type, data: record.data };
         return formatResponse(
           params.response_format,
-          `Updated line ${params.line_index} in ${params.domain}:\n- before: ${fmtRecord(existing)}\n- after: ${fmtRecord(after)}\n(new serial ${newSerial ?? "n/a"})`,
+          `Updated line ${params.line_index} in ${params.domain}:\n- before: ${fmtRecord(existing)}\n- after: ${fmtRecord(after)}\n(new serial ${newSerial ?? "n/a"})\n${RELIST_NOTE}`,
           { domain: params.domain, before: existing, after: record, new_serial: newSerial }
         );
       } catch (e) {
@@ -510,11 +537,13 @@ export function registerDnsTools(server: ToolRegistrar) {
     "whm_remove_dns_record",
     {
       title: "Remove DNS Record",
-      description: "Remove the DNS record at a line_index from whm_get_dns_zone. Confirm with user.",
+      description:
+        "Remove the DNS record at a line_index from whm_get_dns_zone, passing the serial from that same listing. " +
+        "To remove several records, use whm_mass_edit_dns_zone so they all come from one listing. Confirm with user.",
       inputSchema: {
         domain: z.string(),
         line_index: z.number().int().min(0).describe("The record's line_index from whm_get_dns_zone"),
-        serial: SerialSchema,
+        serial: ListingSerialSchema,
         ...FormatSchema,
       },
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
@@ -522,15 +551,16 @@ export function registerDnsTools(server: ToolRegistrar) {
     async (params) => {
       try {
         const zone = await fetchZone(params.domain);
+        assertListingCurrent(params.domain, params.serial, zone.serial);
         const existing = zone.records.find((r) => r.line_index === params.line_index);
         if (!existing) {
           return err(`No record starts at line_index ${params.line_index} in ${params.domain}. Run whm_get_dns_zone to find it.`);
         }
         if (existing.type === "SOA") return err("Refusing to remove the zone's SOA record.");
-        const newSerial = await massEditZone(params.domain, params.serial ?? zone.serial, { remove: [params.line_index] });
+        const newSerial = await massEditZone(params.domain, params.serial, { remove: [params.line_index] });
         return formatResponse(
           params.response_format,
-          `Removed from ${params.domain}: ${fmtRecord(existing)} (new serial ${newSerial ?? "n/a"}).`,
+          `Removed from ${params.domain}: ${fmtRecord(existing)} (new serial ${newSerial ?? "n/a"}).\n${RELIST_NOTE}`,
           { domain: params.domain, removed: existing, new_serial: newSerial }
         );
       } catch (e) {
@@ -564,14 +594,16 @@ export function registerDnsTools(server: ToolRegistrar) {
     {
       title: "Batch Edit DNS Zone",
       description:
-        "Add, edit, and remove many records in one atomic zone update. Edits and removals use line_index values from whm_get_dns_zone; " +
-        "an edit keeps the name, type, TTL, or data you leave out. Confirm with user.",
+        "Add, edit, and remove many records in one atomic zone update. Edits and removals use line_index values from whm_get_dns_zone " +
+        "and need the serial from that same listing; an edit keeps the name, type, TTL, or data you leave out. Confirm with user.",
       inputSchema: {
         domain: z.string(),
         add: z.array(MassAddSchema).optional().describe("Records to add"),
         edit: z.array(MassEditSchema).optional().describe("Records to change, by line_index"),
         remove: z.array(z.number().int().min(0)).optional().describe("line_index values of records to remove"),
-        serial: SerialSchema,
+        serial: SerialSchema.describe(
+          "Zone serial from the whm_get_dns_zone listing the line_index values came from. Required with 'edit' or 'remove'; optional when only adding"
+        ),
         ...FormatSchema,
       },
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
@@ -580,7 +612,12 @@ export function registerDnsTools(server: ToolRegistrar) {
       try {
         const counts = { add: params.add?.length ?? 0, edit: params.edit?.length ?? 0, remove: params.remove?.length ?? 0 };
         if (counts.add + counts.edit + counts.remove === 0) return err("Pass at least one of 'add', 'edit', or 'remove'.");
+        const usesLines = counts.edit + counts.remove > 0;
+        if (usesLines && params.serial === undefined) {
+          return err("Pass 'serial' (from the whm_get_dns_zone listing the line_index values came from) when editing or removing records.");
+        }
         const zone = await fetchZone(params.domain);
+        if (usesLines) assertListingCurrent(params.domain, params.serial!, zone.serial);
         const byLine = new Map(zone.records.map((r) => [r.line_index, r]));
         for (const line of [...(params.remove ?? []), ...(params.edit ?? []).map((r) => r.line_index)]) {
           if (!byLine.has(line)) return err(`No record starts at line_index ${line} in ${params.domain}.`);
@@ -616,7 +653,7 @@ export function registerDnsTools(server: ToolRegistrar) {
         });
         return formatResponse(
           params.response_format,
-          `Updated ${params.domain}: ${counts.add} added, ${counts.edit} edited, ${counts.remove} removed (new serial ${newSerial ?? "n/a"}).`,
+          `Updated ${params.domain}: ${counts.add} added, ${counts.edit} edited, ${counts.remove} removed (new serial ${newSerial ?? "n/a"}).\n${RELIST_NOTE}`,
           { domain: params.domain, ...counts, new_serial: newSerial }
         );
       } catch (e) {

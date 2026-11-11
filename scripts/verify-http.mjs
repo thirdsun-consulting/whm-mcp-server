@@ -49,7 +49,7 @@ await client.close();
 srv.child.kill();
 
 const rw = await start({ MCP_AUTH_TOKEN: TOKEN, WHM_READ_ONLY: "false" });
-check(rw.tools === 91, `WHM_READ_ONLY=false should expose all tools, got ${rw.tools}`);
+check(rw.tools === 92, `WHM_READ_ONLY=false should expose all tools, got ${rw.tools}`);
 rw.child.kill();
 
 if (failures.length) { console.log(failures.map((f) => `- ${f}`).join("\n")); process.exit(1); }

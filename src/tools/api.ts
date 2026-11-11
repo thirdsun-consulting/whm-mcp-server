@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { handleWhmError, uapiCall, whmCall, whmRequest } from "../services/client.js";
-import { codeBlock, err, formatResponse, matches } from "../services/format.js";
+import { codeBlock, err, formatResponse, matches, redactSecrets } from "../services/format.js";
 import { FormatSchema } from "../schemas/common.js";
 import { ToolRegistrar } from "../types.js";
 
@@ -11,6 +11,14 @@ const ParamsSchema = z
     "Function parameters. Booleans are sent as 1/0; arrays use WHM's param, param-1, param-2 convention. " +
       "WHM API 1 output controls also work, e.g. {'api.filter.enable': 1, 'api.filter.a.field': 'user', 'api.filter.a.arg0': 'bob'}, " +
       "api.sort.*, and api.chunk.* for paging."
+  );
+
+const RevealSecretsSchema = z
+  .boolean()
+  .default(false)
+  .describe(
+    "Passwords, tokens, secret keys, and private keys in the response are replaced with '[redacted]' by default. " +
+      "Set true only when the user explicitly needs such a value returned (e.g. a newly created API token)"
   );
 
 export function registerApiTools(server: ToolRegistrar) {
@@ -46,7 +54,8 @@ export function registerApiTools(server: ToolRegistrar) {
       description:
         "Call any WHM API 1 function by name with raw parameters and get its full response ({ metadata, data }). " +
         "For functions without a dedicated tool — look them up at https://api.docs.cpanel.net/whm/introduction. " +
-        "Can change or delete anything the token allows: prefer the dedicated tools, and confirm any change with the user first.",
+        "Can change or delete anything the token allows: prefer the dedicated tools, and confirm any change with the user first. " +
+        "Credential-like fields in the response are redacted unless reveal_secrets is set.",
       inputSchema: {
         function: z
           .string()
@@ -57,6 +66,7 @@ export function registerApiTools(server: ToolRegistrar) {
           .enum(["POST", "GET"])
           .default("POST")
           .describe("POST (default) keeps parameters such as passwords out of URLs and access logs"),
+        reveal_secrets: RevealSecretsSchema,
         ...FormatSchema,
       },
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
@@ -64,7 +74,8 @@ export function registerApiTools(server: ToolRegistrar) {
     async (params) => {
       try {
         const res = await whmRequest(params.function, params.params, params.method);
-        const result = { metadata: res.metadata, data: res.data };
+        const raw = { metadata: res.metadata, data: res.data };
+        const result = params.reveal_secrets ? raw : redactSecrets(raw);
         return formatResponse(
           params.response_format,
           `# ${params.function}\n${codeBlock(JSON.stringify(result, null, 2))}`,
@@ -83,7 +94,8 @@ export function registerApiTools(server: ToolRegistrar) {
       description:
         "Run a cPanel UAPI function as a specific cPanel account through WHM (uapi_cpanel) — e.g. module 'Email' function 'list_forwarders', " +
         "or 'Mysql'/'list_databases'. UAPI docs: https://api.docs.cpanel.net/cpanel/introduction. " +
-        "Can change or delete the account's data: confirm any change with the user first.",
+        "Can change or delete the account's data: confirm any change with the user first. " +
+        "Credential-like fields in the response are redacted unless reveal_secrets is set.",
       inputSchema: {
         user: z.string().describe("cPanel account to run as (lowercase)"),
         module: z.string().regex(/^[A-Za-z0-9_]+$/).describe("UAPI module, e.g. 'Email' (case-sensitive)"),
@@ -93,6 +105,7 @@ export function registerApiTools(server: ToolRegistrar) {
           .enum(["POST", "GET"])
           .default("POST")
           .describe("POST (default) keeps parameters such as passwords out of URLs and access logs"),
+        reveal_secrets: RevealSecretsSchema,
         ...FormatSchema,
       },
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
@@ -100,12 +113,13 @@ export function registerApiTools(server: ToolRegistrar) {
     async (params) => {
       try {
         const res = await uapiCall(params.user, params.module, params.function, params.params, params.method);
-        const result = {
+        const raw = {
           data: res.data,
           messages: res.messages ?? [],
           warnings: res.warnings ?? [],
           metadata: res.metadata ?? {},
         };
+        const result = params.reveal_secrets ? raw : redactSecrets(raw);
         return formatResponse(
           params.response_format,
           `# ${params.module}::${params.function} as ${params.user}\n${codeBlock(JSON.stringify(result, null, 2))}`,

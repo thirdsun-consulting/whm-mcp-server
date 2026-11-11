@@ -17,7 +17,7 @@
  * Tool selection (env vars):
  *   WHM_READ_ONLY - register only read-only tools. Any value other than
  *                   empty/0/false/no/off turns it on; in HTTP mode it defaults on.
- *   WHM_TOOLSETS  - comma-separated toolsets to enable (default: all)
+ *   WHM_TOOLSETS  - comma-separated toolsets to enable (default, or 'all': every toolset)
  *
  * Transport: stdio by default; `--http` or MCP_TRANSPORT=http serves
  * Streamable HTTP for remote connectors (see src/http.ts).
@@ -66,10 +66,12 @@ function envFlag(value: string | undefined, fallback: boolean): boolean {
 }
 
 function selectToolsets(value: string | undefined): string[] {
-  const requested = (value ?? "")
+  const names = (value ?? "")
     .split(",")
     .map((s) => s.trim().toLowerCase())
     .filter(Boolean);
+  // "all" is the same as leaving it unset.
+  const requested = names.includes("all") ? [] : names;
   const unknown = requested.filter((name) => !(name in TOOLSETS));
   if (unknown.length) {
     process.stderr.write(
@@ -79,21 +81,33 @@ function selectToolsets(value: string | undefined): string[] {
   return Object.keys(TOOLSETS).filter((name) => requested.length === 0 || requested.includes(name));
 }
 
-function buildServer(readOnly: boolean, toolsets: string[]): { server: McpServer; toolCount: number } {
+type ToolDefinition = [name: string, config: any, callback: any];
+
+/**
+ * Run the toolset modules once and keep their tool definitions (name, config
+ * with its zod schemas, handler). HTTP mode needs a new McpServer per request;
+ * replaying these is much cheaper than rebuilding every schema each time.
+ */
+function collectTools(readOnly: boolean, toolsets: string[]): ToolDefinition[] {
+  const tools: ToolDefinition[] = [];
+  const registrar: ToolRegistrar = {
+    registerTool: ((name: string, config: any, callback: any) => {
+      if (readOnly && config?.annotations?.readOnlyHint !== true) return undefined;
+      tools.push([name, config, callback]);
+      return undefined;
+    }) as unknown as McpServer["registerTool"],
+  };
+  for (const name of toolsets) TOOLSETS[name](registrar);
+  return tools;
+}
+
+function buildServer(tools: ToolDefinition[]): McpServer {
   const server = new McpServer({
     name: "whm-mcp-server",
     version: SERVER_VERSION,
   });
-  let toolCount = 0;
-  const registrar: ToolRegistrar = {
-    registerTool: ((name: string, config: any, callback: any) => {
-      if (readOnly && config?.annotations?.readOnlyHint !== true) return undefined;
-      toolCount++;
-      return server.registerTool(name, config, callback);
-    }) as McpServer["registerTool"],
-  };
-  for (const name of toolsets) TOOLSETS[name](registrar);
-  return { server, toolCount };
+  for (const [name, config, callback] of tools) server.registerTool(name, config, callback);
+  return server;
 }
 
 async function main() {
@@ -101,12 +115,12 @@ async function main() {
   // A remote endpoint starts read-only unless WHM_READ_ONLY is explicitly off.
   const readOnly = envFlag(process.env.WHM_READ_ONLY, httpMode);
   const toolsets = selectToolsets(process.env.WHM_TOOLSETS);
-  const { server, toolCount } = buildServer(readOnly, toolsets);
-  const summary = `${toolCount} tools${readOnly ? ", read-only" : ""}; toolsets: ${toolsets.join(", ")}`;
+  const tools = collectTools(readOnly, toolsets);
+  const summary = `${tools.length} tools${readOnly ? ", read-only" : ""}; toolsets: ${toolsets.join(", ")}`;
 
   if (httpMode) {
     const opts = httpOptionsFromEnv();
-    const http = await startHttpServer(() => buildServer(readOnly, toolsets).server, opts);
+    const http = await startHttpServer(() => buildServer(tools), opts);
     const address = http.address();
     const port = typeof address === "object" && address ? address.port : opts.port;
     process.stderr.write(`whm-mcp-server: listening on http://${opts.host}:${port}${opts.path} (${summary})\n`);
@@ -114,7 +128,7 @@ async function main() {
   }
 
   const transport = new StdioServerTransport();
-  await server.connect(transport);
+  await buildServer(tools).connect(transport);
   process.stderr.write(`whm-mcp-server: listening on stdio (${summary})\n`);
 }
 

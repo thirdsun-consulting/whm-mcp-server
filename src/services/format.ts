@@ -27,20 +27,53 @@ export function formatResponse(
   // MCP structuredContent must be a JSON object.
   const payload =
     Array.isArray(structured) ? { items: structured } : structured !== null && typeof structured === "object" ? structured : undefined;
-  let text =
-    format === ResponseFormat.JSON ? JSON.stringify(payload ?? structured ?? null, null, 2) : markdown;
-  if (text.length > CHARACTER_LIMIT) {
-    text =
-      text.slice(0, CHARACTER_LIMIT - 200) +
-      `\n\n[Response truncated at ${CHARACTER_LIMIT} characters. Add filters, lower 'limit', or page with 'offset'.]`;
-  }
+  const asJson = format === ResponseFormat.JSON;
+  let text = asJson ? JSON.stringify(payload ?? structured ?? null, null, 2) : markdown;
   // Clients may pass structuredContent to the model as-is, so bound it too.
   const size = payload === undefined ? 0 : JSON.stringify(payload).length;
-  if (size > STRUCTURED_LIMIT) {
-    text += `\n\n[Structured data omitted: ${size} characters is over the ${STRUCTURED_LIMIT}-character limit. Add filters or lower 'limit'.]`;
-    return ok(text);
+  const structuredOmitted = size > STRUCTURED_LIMIT;
+  if (asJson) {
+    // JSON output has to stay parseable, so an oversized result becomes a small JSON envelope.
+    if (text.length > CHARACTER_LIMIT) text = truncatedJson(text, structuredOmitted);
+  } else {
+    if (text.length > CHARACTER_LIMIT) {
+      text =
+        text.slice(0, CHARACTER_LIMIT - 200) +
+        `\n\n[Response truncated at ${CHARACTER_LIMIT} characters. Add filters, lower 'limit', or page with 'offset'.]`;
+    }
+    if (structuredOmitted) {
+      text += `\n\n[Structured data omitted: ${size} characters is over the ${STRUCTURED_LIMIT}-character limit. Add filters or lower 'limit'.]`;
+    }
   }
-  return ok(text, payload);
+  return structuredOmitted ? ok(text) : ok(text, payload);
+}
+
+/**
+ * Wrap JSON that is over CHARACTER_LIMIT in a valid JSON object carrying the
+ * start of the original as a string, instead of cutting it mid-structure.
+ */
+function truncatedJson(full: string, structuredOmitted: boolean): string {
+  const envelope = (preview: string) =>
+    JSON.stringify(
+      {
+        truncated: true,
+        total_characters: full.length,
+        limit: CHARACTER_LIMIT,
+        hint: "Add filters, lower 'limit', or page with 'offset'.",
+        ...(structuredOmitted ? { structured_content_omitted: true } : {}),
+        preview,
+      },
+      null,
+      2
+    );
+  // Escaping makes the preview longer once serialized, so shrink it until the whole envelope fits.
+  let length = CHARACTER_LIMIT - 400;
+  let text = envelope(full.slice(0, length));
+  while (text.length > CHARACTER_LIMIT && length > 0) {
+    length = Math.floor(length * 0.85);
+    text = envelope(full.slice(0, length));
+  }
+  return text;
 }
 
 export function fmtBytes(bytes: number | string | undefined | null): string {
@@ -134,8 +167,12 @@ export function matches(haystack: unknown, needle: string | undefined): boolean 
 }
 
 const SECRET_KEY = /(secret|passw|application_key|private_?key|token|api_key)/i;
+const PRIVATE_KEY_PEM = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/;
 
-/** Mask credential-like fields (backup destination secrets, etc.) before they reach the model. */
+/**
+ * Mask credential-like fields (backup destination secrets, etc.) and PEM
+ * private keys under any field name before they reach the model.
+ */
 export function redactSecrets<T>(value: T): T {
   if (Array.isArray(value)) return value.map((v) => redactSecrets(v)) as T;
   if (value && typeof value === "object") {
@@ -145,6 +182,7 @@ export function redactSecrets<T>(value: T): T {
     }
     return out as T;
   }
+  if (typeof value === "string" && PRIVATE_KEY_PEM.test(value)) return "[redacted private key]" as T;
   return value;
 }
 

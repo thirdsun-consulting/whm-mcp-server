@@ -1,0 +1,59 @@
+{
+  "name": "whm-mcp",
+  "displayName": "WHM Server Admin",
+  "version": "0.3.0",
+  "description": "Administer a cPanel & WHM server through the WHM API: accounts, domains, DNS, email, packages, SSL, backups, resellers, security, PHP, and logs. Starts read-only; turning on changes is a setting.",
+  "author": {
+    "name": "thirdsun-consulting"
+  },
+  "repository": "https://github.com/thirdsun-consulting/whm-mcp-server",
+  "license": "MIT",
+  "keywords": ["whm", "cpanel", "hosting", "dns", "email", "mcp"],
+  "userConfig": {
+    "whm_host": {
+      "type": "string",
+      "title": "WHM host",
+      "description": "Hostname of the WHM server, e.g. srv.example.com. Use the name on WHM's SSL certificate.",
+      "required": true
+    },
+    "whm_token": {
+      "type": "string",
+      "title": "WHM API token",
+      "description": "Create one in WHM under Development > Manage API Tokens. Its privileges limit what this plugin can do.",
+      "required": true,
+      "sensitive": true
+    },
+    "whm_user": {
+      "type": "string",
+      "title": "WHM user",
+      "description": "The WHM user the token belongs to: root, or a reseller.",
+      "default": "root"
+    },
+    "whm_port": {
+      "type": "number",
+      "title": "WHM port",
+      "description": "WHM's HTTPS port.",
+      "default": 2087,
+      "min": 1,
+      "max": 65535
+    },
+    "read_only": {
+      "type": "boolean",
+      "title": "Read-only mode",
+      "description": "On: only tools that read are available. Off: Claude can also change the server (delete accounts, edit DNS, restart services, reboot), each with a confirmation.",
+      "default": true
+    },
+    "toolsets": {
+      "type": "string",
+      "title": "Toolsets",
+      "description": "'all', or a comma-separated subset to keep the tool list short: accounts, domains, server, dns, email, packages, ssl, backups, resellers, security, software, logs, api.",
+      "default": "all"
+    },
+    "insecure_tls": {
+      "type": "boolean",
+      "title": "Skip TLS verification",
+      "description": "Only for a server you trust that has a self-signed certificate.",
+      "default": false
+    }
+  }
+}

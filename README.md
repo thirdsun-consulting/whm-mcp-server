@@ -15,20 +15,51 @@ Full guide: [docs/GUIDE.md](docs/GUIDE.md). Every tool is checked against cPanel
 | `email` | `get_mail_queue_summary`, `list_mail_queue`, `get_exim_stats`, `search_mail_delivery_log`, `manage_outgoing_email`, `list_pop_accounts_for_user`, `list_pop_accounts_with_disk`, `validate_mail_dns`, `enable_dkim`, `validate_exim_config` |
 | `packages` | `list_packages`, `get_package`, `create_package`, `edit_package`, `delete_package` |
 | `ssl` | `list_ssl_certs`, `get_ssl_info`, `install_ssl`, `start_autossl_check`, `get_autossl_problems`, `get_autossl_log` |
-| `backups` | `get_backup_config`, `list_backup_destinations`, `list_backup_dates`, `list_backup_users`, `backup_account`, `get_account_backup_status`, `restore_account`, `get_restore_queue` |
+| `backups` | `get_backup_config`, `list_backup_destinations`, `list_backup_dates`, `list_backup_users`, `backup_account`, `get_account_backup_status`, `restore_account`, `start_restore_queue`, `get_restore_queue` |
 | `resellers` | `list_resellers`, `get_reseller_stats`, `set_reseller_limits`, `setup_reseller`, `remove_reseller` |
 | `security` | `get_cphulk_status`, `get_failed_logins`, `list_cphulk_records`, `add_cphulk_record`, `remove_cphulk_record`, `unblock_ips`, `get_security_advice` |
 | `software` | `list_php_versions`, `get_php_vhost_versions`, `set_php_vhost_version`, `list_databases` |
 | `logs` | `get_domain_error_log`, `get_modsec_log` |
 | `api` | `list_api_functions`, `call_api`, `call_uapi` |
 
-All tools are prefixed `whm_` (91 in total). Read-only tools are marked `readOnlyHint: true`. Tools that delete, overwrite, suspend, restart, or reboot are marked `destructiveHint: true`, and their descriptions ask the model to confirm with you first.
+All tools are prefixed `whm_` (92 in total). Read-only tools are marked `readOnlyHint: true`. Tools that delete, overwrite, suspend, restart, or reboot are marked `destructiveHint: true`, and their descriptions ask the model to confirm with you first.
 
 - Every tool accepts `response_format`: `markdown` (default) or `json`.
 - List tools page with `limit`/`offset` and report `total`, `has_more`, and `next_offset`.
 - For anything without a dedicated tool, `whm_call_api` calls any WHM API 1 function and `whm_call_uapi` runs any UAPI function as a cPanel user.
 
-## Install
+## Install as a Claude Code plugin
+
+The repository is also a plugin marketplace. The plugin runs a prebuilt copy of the server (`plugin/bundle.cjs`), so there is nothing to build:
+
+```bash
+claude plugin marketplace add thirdsun-consulting/whm-mcp-server
+```
+
+```bash
+claude plugin install whm-mcp@thirdsun-whm
+```
+
+Or, inside Claude Code 2.1.275 or later, in one step: `/plugin install whm-mcp --marketplace thirdsun-consulting/whm-mcp-server`.
+
+Claude Code then asks for the plugin's options:
+
+| Option | Default | Notes |
+|--------|---------|-------|
+| WHM host | (required) | Hostname of the WHM server |
+| WHM API token | (required) | Kept in your system's credential store, not in a settings file |
+| WHM user | `root` | The user the token belongs to |
+| WHM port | `2087` | |
+| Read-only mode | on | Turn off to let Claude change the server |
+| Toolsets | `all` | A comma-separated subset keeps the tool list short |
+| Skip TLS verification | off | Only for a trusted server with a self-signed certificate |
+
+- The plugin starts **read-only** (51 tools). Turn off **Read-only mode** in `/plugin` to add the tools that change the server.
+- It includes two skills: `whm-safe-changes` (what to read and confirm before a change) and `whm-troubleshooting` (which tools to use for common hosting problems).
+- To try it from a checkout without installing: `claude --plugin-dir ./plugin`.
+- After changing anything under `src/`, run `npm run bundle` and commit `plugin/bundle.cjs`. CI fails if the bundle is out of date.
+
+## Install from source
 
 ```bash
 git clone <your-fork-url> whm-mcp-server
@@ -59,7 +90,7 @@ Requests are sent as `Authorization: whm $WHM_USER:$WHM_TOKEN` to `https://$WHM_
 With every toolset enabled the tool list is large (~24k tokens of tool definitions). Trim it for your use case:
 
 ```bash
-# Only these toolsets (comma-separated, from the table above):
+# Only these toolsets (comma-separated, from the table above; unset or "all" = every toolset):
 export WHM_TOOLSETS="accounts,dns,email,logs"
 
 # Only read-only tools — safe for monitoring and support lookups:
@@ -118,6 +149,15 @@ npm start -- --http                                # or MCP_TRANSPORT=http
 
 `npm run verify:http` checks auth, routing, and the read-only default.
 
+## Tests
+
+```bash
+npm run build
+npm test
+```
+
+`scripts/test-offline.mjs` needs no network. It runs the server against a small stateful mock WHM and checks behaviour the spec check can't: zones whose line numbers shift, the restore queue, packages WHM resets, redaction in the raw API tools, oversized results, and the plugin's start-up configuration. Set `WHM_SERVER_ENTRY=plugin/bundle.cjs` to run it against the plugin bundle.
+
 ## Verifying against the WHM API docs
 
 ```bash
@@ -137,10 +177,12 @@ Tool-specific cases also cover request-building logic (DNS edits, package merges
 
 - WHM API 1 responses use a `metadata.result` envelope. The server checks it (and UAPI's `status`/`errors` for `uapi_cpanel` calls) and turns failures into tool errors carrying WHM's reason.
 - Parameters follow WHM's conventions: booleans are sent as `1`/`0`, and multi-valued parameters use `name`, `name-1`, `name-2`, ….
-- DNS tools use `parse_dns_zone` and `mass_edit_dns_zone`, the replacements for the deprecated `dumpzone`. `whm_get_dns_zone` returns each record's `line_index` and the zone serial. Edits pass the serial so they fail instead of clobbering a zone that changed in the meantime.
-- `whm_edit_package` resends the package's current settings along with your changes. `editpkg` would otherwise apply defaults to omitted values and drop package extensions.
+- DNS tools use `parse_dns_zone` and `mass_edit_dns_zone`, the replacements for the deprecated `dumpzone`. `whm_get_dns_zone` returns each record's `line_index` and the zone serial. Line numbers shift whenever a record is added or removed, so `whm_edit_dns_record`, `whm_remove_dns_record`, and edits/removals in `whm_mass_edit_dns_zone` require the serial from the same listing and are refused if the zone has changed since. List the zone again after each change, or use `whm_mass_edit_dns_zone` to change several records from one listing.
+- `whm_edit_package` resends the package's current settings along with your changes. `editpkg` would otherwise apply defaults to omitted values and drop package extensions. It then re-reads the package and reports any setting that changed without being asked.
+- `whm_restore_account` won't start the restore queue while other restores are pending, because starting it runs all of them. Queue with `activate=false`, review with `whm_get_restore_queue`, then run everything with `whm_start_restore_queue`.
 - `whm_set_php_vhost_version` keeps each site's PHP-FPM setting unless you pass `php_fpm`.
-- Backup destination credentials are redacted from tool output.
+- Backup destination credentials are redacted from tool output. `whm_call_api` and `whm_call_uapi` redact passwords, tokens, secret keys, and private keys too, unless you pass `reveal_secrets: true`.
+- `response_format: "json"` always returns valid JSON. A result over 25,000 characters comes back as `{ "truncated": true, "preview": "…" }` instead of being cut mid-structure.
 - Log tools use the sources WHM documents:
   - a domain's Apache error log (UAPI `Stats::get_site_errors`)
   - ModSecurity hits
@@ -150,6 +192,12 @@ Tool-specific cases also cover request-building logic (DNS edits, package merges
 
   There is no WHM API for tailing arbitrary server log files.
 - If you see TLS errors on a server with a self-signed cert, set `WHM_INSECURE_TLS=true`.
+
+## Upgrading from 0.2
+
+- `whm_edit_dns_record` and `whm_remove_dns_record` now require `serial` (from `whm_get_dns_zone`), and so does `whm_mass_edit_dns_zone` when it edits or removes.
+- `whm_call_api` and `whm_call_uapi` redact credential-like fields; pass `reveal_secrets: true` to get them.
+- New tool: `whm_start_restore_queue`.
 
 ## Upgrading from 0.1
 
@@ -167,7 +215,7 @@ Tool-specific cases also cover request-building logic (DNS edits, package merges
 Changed inputs:
 
 - `whm_create_package` and `whm_edit_package` take lowercase limit names (`quota`, `bwlimit`, `maxsub`, …), matching the API.
-- `whm_edit_dns_record` and `whm_remove_dns_record` take `line_index` from `whm_get_dns_zone`.
+- `whm_edit_dns_record` and `whm_remove_dns_record` take `line_index` and `serial` from `whm_get_dns_zone`.
 - `whm_add_dns_record` accepts the same per-type fields as before, or a `data` array. CAA records use `caa_flag`/`caa_tag`/`caa_value`.
 - `whm_create_account` takes `dedicated_ip` (boolean) and `customip` (a specific address) instead of `ip`.
 - `whm_modify_account` takes `contactemail` in lowercase and no longer takes `BWLIMIT`, which WHM reads as bytes. Use `whm_set_bandwidth_limit` instead.
