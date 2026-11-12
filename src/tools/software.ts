@@ -115,8 +115,20 @@ export function registerSoftwareTools(server: ToolRegistrar) {
             groups.set(on, [...(groups.get(on) ?? []), vhost]);
           }
         }
+        // One call per PHP-FPM setting. If a later call fails, say what the earlier ones already changed.
+        const applied: string[] = [];
         for (const [on, vhosts] of groups) {
-          await whmCall("php_set_vhost_versions", { version: params.version, vhost: vhosts, php_fpm: on }, "POST");
+          try {
+            await whmCall("php_set_vhost_versions", { version: params.version, vhost: vhosts, php_fpm: on }, "POST");
+          } catch (e) {
+            const message = handleWhmError(e);
+            if (applied.length === 0) return err(message);
+            return err(
+              `${message}\nPartly applied: ${applied.join(", ")} already changed to ${params.version}; ` +
+                `${vhosts.join(", ")} did not. Check with whm_get_php_vhost_versions.`
+            );
+          }
+          applied.push(...vhosts);
         }
         return formatResponse(
           params.response_format,

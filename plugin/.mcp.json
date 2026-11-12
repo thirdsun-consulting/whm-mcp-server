@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "whm": {
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/bundle.cjs"],
+      "env": {
+        "WHM_HOST": "${user_config.whm_host}",
+        "WHM_TOKEN": "${user_config.whm_token}",
+        "WHM_USER": "${user_config.whm_user}",
+        "WHM_PORT": "${user_config.whm_port}",
+        "WHM_READ_ONLY": "${user_config.read_only}",
+        "WHM_TOOLSETS": "${user_config.toolsets}",
+        "WHM_INSECURE_TLS": "${user_config.insecure_tls}"
+      }
+    }
+  }
+}

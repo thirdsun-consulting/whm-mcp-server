@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Offline behaviour tests
+        run: npm test
+      - name: HTTP transport checks
+        run: npm run verify:http
+      - name: Plugin bundle is up to date
+        run: npm run bundle -- --check
+      - name: Offline behaviour tests against the plugin bundle
+        run: npm test
+        env:
+          WHM_SERVER_ENTRY: plugin/bundle.cjs
+      - name: Check every tool against cPanel's API spec
+        run: npm run verify:spec

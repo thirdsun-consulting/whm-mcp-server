@@ -17,7 +17,7 @@ This guide explains what the server is, how it works, how to connect it to Claud
 
 ## 1. What it is
 
-`whm-mcp-server` is a [Model Context Protocol](https://modelcontextprotocol.io) server that lets an AI assistant such as Claude administer a cPanel & WHM server. It wraps the official [WHM API 1](https://api.docs.cpanel.net/whm/introduction) in 91 purpose-built tools: accounts, domains, DNS, email, packages, SSL, backups, resellers, login security, PHP, logs. Two escape-hatch tools reach any other WHM or UAPI function.
+`whm-mcp-server` is a [Model Context Protocol](https://modelcontextprotocol.io) server that lets an AI assistant such as Claude administer a cPanel & WHM server. It wraps the official [WHM API 1](https://api.docs.cpanel.net/whm/introduction) in 92 purpose-built tools: accounts, domains, DNS, email, packages, SSL, backups, resellers, login security, PHP, logs. Two escape-hatch tools reach any other WHM or UAPI function.
 
 You ask in plain language ("why is mail from example.com bouncing?", "which accounts are over 90% of their quota?"), and Claude picks the tools, calls WHM, and explains the results.
 
@@ -42,7 +42,7 @@ Details worth knowing:
 - **Output.** Every tool returns readable markdown by default, or full JSON with `response_format: "json"`. Results also carry `structuredContent` for clients that use it. Large lists are paged with `limit`/`offset`, and responses are capped (~25k characters) to protect the model's context.
 - **Multi-step tools.** Some tools make several calls to do the safe thing. For example:
   - `whm_edit_package` reads the plan first and resends its current settings.
-  - DNS edits fetch the zone to find the record and the current serial.
+  - DNS edits fetch the zone to find the record, and refuse to run if its serial isn't the one you listed it with.
   - `whm_get_server_information` combines 9 calls.
 - **Transports.** By default the server talks MCP over **stdio**: the client launches it as a local process. With `--http` it serves **Streamable HTTP**, so it can be hosted and reached remotely.
 
@@ -69,6 +69,20 @@ npm run build
 A reseller's token works too. Tools are then limited to what that reseller may do.
 
 ## 4. Connecting it
+
+### Claude Code plugin
+
+The quickest route. The repository is a plugin marketplace, and the plugin carries a prebuilt server, so section 3's clone and build aren't needed:
+
+```bash
+claude plugin marketplace add thirdsun-consulting/whm-mcp-server
+```
+
+```bash
+claude plugin install whm-mcp@thirdsun-whm
+```
+
+Claude Code asks for the WHM host and API token (the token goes to your system's credential store) and offers the other options with defaults. The plugin starts in **read-only mode**; turn that option off in `/plugin` when you want Claude to be able to change the server. It also adds two skills, `whm-safe-changes` and `whm-troubleshooting`, which Claude loads when they apply.
 
 ### Claude Code (local, stdio)
 
@@ -171,7 +185,7 @@ This opens a browser UI where you can call each tool by hand, which is useful to
 
 **Toolsets:** `accounts`, `domains`, `server`, `dns`, `email`, `packages`, `ssl`, `backups`, `resellers`, `security`, `software`, `logs`, `api`.
 
-All 91 tool definitions come to about 24k tokens of context. Trimming the toolsets makes the model faster and more accurate.
+All 92 tool definitions come to about 24k tokens of context. Trimming the toolsets makes the model faster and more accurate.
 
 ## 6. Using it
 
@@ -255,9 +269,9 @@ All names are prefixed `whm_`. **R** = read-only. **W** = changes something but 
 | `get_dns_zone` | R | Records with `line_index` and the zone serial; filter by type or name. |
 | `create_dns_zone` / `delete_dns_zone` | W / D | Create or delete a zone. |
 | `add_dns_record` | W | Add a record using per-type fields (`address`, `cname`, `exchange`+`preference`, `txtdata`, SRV fields, CAA fields) or a raw `data` array. |
-| `edit_dns_record` | D | Change a record by `line_index`; only the fields you pass change. |
-| `remove_dns_record` | D | Remove a record (won't remove the SOA). |
-| `mass_edit_dns_zone` | D | Add, edit and remove many records in one atomic update. |
+| `edit_dns_record` | D | Change a record by `line_index` and the listing's `serial`; only the fields you pass change. |
+| `remove_dns_record` | D | Remove a record by `line_index` and the listing's `serial` (won't remove the SOA). |
+| `mass_edit_dns_zone` | D | Add, edit and remove many records in one atomic update; edits and removals need the listing's `serial`. |
 | `reset_dns_zone` | D | Reset a zone to defaults (keeps valid TXT records). |
 
 DNS name rules:
@@ -265,7 +279,7 @@ DNS name rules:
 - Dotless names like `www` are relative to the zone.
 - Names containing a dot are treated as fully qualified; the trailing dot is added for you.
 - Long TXT values (DKIM keys) are split automatically.
-- Edits pass the zone serial, so they fail rather than overwrite concurrent changes.
+- A record's `line_index` is its position in the zone file, so it shifts whenever a record is added or removed. Edits and removals therefore need the `serial` from the same `get_dns_zone` listing, and are refused if the zone has changed since. List the zone again after each change, or change several records at once with `mass_edit_dns_zone`.
 
 ### email
 
@@ -288,7 +302,7 @@ DNS name rules:
 |---|---|---|
 | `list_packages` / `get_package` | R | Plans and their limits. |
 | `create_package` | W | New plan. Limits use lowercase names (`quota`, `maxsub`…). |
-| `edit_package` | D | Change a plan; other settings and extensions are preserved. Affects every account on the plan. |
+| `edit_package` | D | Change a plan; other settings and extensions are preserved, and any that change anyway are reported. Affects every account on the plan. |
 | `delete_package` | D | Delete an unused plan. |
 
 ### ssl
@@ -311,6 +325,7 @@ DNS name rules:
 | `list_backup_dates` / `list_backup_users` | R | Available backup dates, and the accounts in a given date's backup. |
 | `backup_account` / `get_account_backup_status` | W / R | On-demand full backup (pkgacct) to the account's home directory, and its status. |
 | `restore_account` | D | Restore from a backup date. Refuses to start the queue while other restores are pending. |
+| `start_restore_queue` | D | Start the restore queue, running every pending restore (after queuing with `activate=false`). |
 | `get_restore_queue` | R | Active, pending and completed restores. |
 
 ### resellers
@@ -354,8 +369,8 @@ DNS name rules:
 | Tool | | What it does |
 |---|---|---|
 | `list_api_functions` | R | WHM functions this token can call. |
-| `call_api` | D | Call any WHM API 1 function with raw parameters (POST by default). |
-| `call_uapi` | D | Run any cPanel UAPI function as a given account. |
+| `call_api` | D | Call any WHM API 1 function with raw parameters (POST by default). Secrets in the response are redacted unless `reveal_secrets` is set. |
+| `call_uapi` | D | Run any cPanel UAPI function as a given account, with the same redaction. |
 
 ## 8. Safety model
 
@@ -368,11 +383,11 @@ The server has several layers of protection:
 5. **Built-in guards:**
    - cpsrvd can't be disabled
    - the SOA record can't be removed
-   - DNS edits use the zone serial
-   - package and PHP edits preserve settings you didn't pass
+   - DNS edits and removals need the serial of the listing their `line_index` came from, so a stale line number can't hit a different record
+   - package and PHP edits preserve settings you didn't pass, and report what changed anyway
    - restores refuse to run other people's queued restores
    - editing a missing package doesn't silently create one
-6. **Secrets.** Backup destination credentials are redacted from output. Private keys aren't fetched. Changes are sent by POST, so they stay out of URLs and logs.
+6. **Secrets.** Backup destination credentials are redacted from output. Private keys aren't fetched. The raw API tools redact passwords, tokens, secret keys and private keys unless `reveal_secrets` is set. Changes are sent by POST, so they stay out of URLs and logs.
 7. **HTTP mode:**
    - bearer token required, compared in constant time
    - binds to localhost; put TLS in front

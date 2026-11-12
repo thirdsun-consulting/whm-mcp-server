@@ -205,7 +205,8 @@ export function registerBackupTools(server: ToolRegistrar) {
       description:
         "Restore a cPanel account from a backup date. OVERWRITES the account's current files (and databases, mail config, and subdomains if selected). " +
         "Always confirm with the user. Queues the restore and starts the restore queue; follow it with whm_get_restore_queue. " +
-        "Starting the queue runs every pending restore, so this refuses to start it while other restores are pending.",
+        "Starting the queue runs every pending restore, so this refuses to start it while other restores are pending: " +
+        "queue with activate=false and start everything with whm_start_restore_queue instead.",
       inputSchema: {
         user: z.string(),
         restore_point: DateSchema,
@@ -230,7 +231,8 @@ export function registerBackupTools(server: ToolRegistrar) {
               `The restore queue already has ${pending.length} pending restore(s) (${pending
                 .map((t) => `${t.user} from ${t.restore_point}`)
                 .join(", ")}); starting it would run those too. ` +
-                "Review them with whm_get_restore_queue, or pass activate=false to only queue this restore."
+                "Review them with whm_get_restore_queue. To run them together with this one, pass activate=false to queue this restore, " +
+                "then call whm_start_restore_queue."
             );
           }
         }
@@ -247,13 +249,58 @@ export function registerBackupTools(server: ToolRegistrar) {
           },
           "POST"
         );
-        if (params.activate) await whmCall("restore_queue_activate", {}, "POST");
+        if (params.activate) {
+          try {
+            await whmCall("restore_queue_activate", {}, "POST");
+          } catch (e) {
+            // The restore is already queued; say so, or a retry would queue it a second time.
+            return err(
+              `Queued the restore of ${params.user} from ${params.restore_point} (queue id ${task?.queue_id ?? "n/a"}), ` +
+                `but the restore queue could not be started: ${handleWhmError(e)} ` +
+                "Do not queue it again; start the queue with whm_start_restore_queue."
+            );
+          }
+        }
         return formatResponse(
           params.response_format,
           `Queued restore of ${params.user} from ${params.restore_point} (queue id ${task?.queue_id ?? "n/a"})${
-            params.activate ? "; restore queue started" : "; start it later with activate=true"
+            params.activate ? "; restore queue started" : "; start it with whm_start_restore_queue"
           }. Track it with whm_get_restore_queue.`,
           { user: params.user, restore_point: params.restore_point, queue_id: task?.queue_id, activated: params.activate }
+        );
+      } catch (e) {
+        return err(handleWhmError(e));
+      }
+    }
+  );
+
+  server.registerTool(
+    "whm_start_restore_queue",
+    {
+      title: "Start Restore Queue",
+      description:
+        "Start the restore queue: runs EVERY pending account restore, each of which overwrites that account's current data. " +
+        "Use it after queuing restores with whm_restore_account (activate=false). Review the queue with whm_get_restore_queue and confirm with the user first.",
+      inputSchema: { ...FormatSchema },
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+    },
+    async (params) => {
+      try {
+        const queue: any = await whmCall("restore_queue_state");
+        const pending: any[] = queue?.pending ?? [];
+        if (pending.length === 0) {
+          return err("The restore queue has no pending restores. Queue one with whm_restore_account first.");
+        }
+        await whmCall("restore_queue_activate", {}, "POST");
+        const started = pending.map((t) => ({ user: t.user, restore_point: t.restore_point }));
+        return formatResponse(
+          params.response_format,
+          [
+            `Started the restore queue with ${started.length} pending restore(s):`,
+            ...started.map((t) => `- ${t.user} from ${t.restore_point}`),
+            "Track progress with whm_get_restore_queue.",
+          ].join("\n"),
+          { activated: true, started }
         );
       } catch (e) {
         return err(handleWhmError(e));

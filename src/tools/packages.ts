@@ -63,12 +63,18 @@ function currentPackageParams(pkg: Record<string, any>): WhmParams {
   const limit = (key: string) =>
     !(key in pkg) ? undefined : pkg[key] === null || pkg[key] === "" ? "unlimited" : pkg[key];
   const flag = (key: string) => (pkg[key] === undefined || pkg[key] === null ? undefined : isTrue(pkg[key]));
-  const extensionVariables = Object.fromEntries(
-    Object.entries(pkg).filter(
-      ([k, v]) => !CORE_PACKAGE_KEYS.has(k) && (typeof v === "string" || typeof v === "number")
-    )
+  const unknown = Object.entries(pkg).filter(
+    ([k, v]) => !CORE_PACKAGE_KEYS.has(k) && (typeof v === "string" || typeof v === "number")
+  );
+  const extensionVariables = Object.fromEntries(unknown);
+  // A key this code doesn't know may be an extension variable (resent under its own name, above)
+  // or a package setting added by a newer WHM. Settings are reported in uppercase but set in
+  // lowercase, so resend uppercase keys in lowercase too; WHM ignores names it doesn't use.
+  const possibleSettings = Object.fromEntries(
+    unknown.filter(([k]) => /^[A-Z][A-Z0-9_]*$/.test(k)).map(([k, v]) => [k.toLowerCase(), v])
   );
   return definedParams({
+    ...possibleSettings,
     ...extensionVariables,
     featurelist: pkg.FEATURELIST,
     quota: limit("QUOTA"),
@@ -96,6 +102,47 @@ function currentPackageParams(pkg: Record<string, any>): WhmParams {
 
 function changedFields(fields: PackageFields): string[] {
   return Object.keys(fields).filter((k) => (fields as Record<string, unknown>)[k] !== undefined);
+}
+
+/** The getpkginfo key each tool field is reported under. */
+const FIELD_TO_PACKAGE_KEY: Record<string, string> = {
+  featurelist: "FEATURELIST",
+  quota: "QUOTA",
+  bwlimit: "BWLIMIT",
+  maxsub: "MAXSUB",
+  maxpark: "MAXPARK",
+  maxaddon: "MAXADDON",
+  maxftp: "MAXFTP",
+  maxsql: "MAXSQL",
+  maxpop: "MAXPOP",
+  maxlst: "MAXLST",
+  max_emailacct_quota: "MAX_EMAILACCT_QUOTA",
+  max_email_per_hour: "MAX_EMAIL_PER_HOUR",
+  max_defer_fail_percentage: "MAX_DEFER_FAIL_PERCENTAGE",
+  hasshell: "HASSHELL",
+  cgi: "CGI",
+  dedicated_ip: "IP",
+  cpmod: "CPMOD",
+  language: "LANG",
+  digestauth: "DIGESTAUTH",
+};
+
+/**
+ * Settings that differ between two getpkginfo results, other than the ones
+ * the caller asked to change. An edit should leave these alone, so anything
+ * listed here was reset by WHM as a side effect.
+ */
+function unintendedChanges(
+  before: Record<string, any>,
+  after: Record<string, any>,
+  changed: string[]
+): { setting: string; before: unknown; after: unknown }[] {
+  const intended = new Set(changed.map((field) => FIELD_TO_PACKAGE_KEY[field] ?? field));
+  const norm = (v: unknown) => (v === null || v === undefined || v === "" || v === "unlimited" ? "unlimited" : String(v));
+  return [...new Set([...Object.keys(before), ...Object.keys(after)])]
+    .filter((key) => !intended.has(key) && typeof before[key] !== "object" && typeof after[key] !== "object")
+    .filter((key) => norm(before[key]) !== norm(after[key]))
+    .map((key) => ({ setting: key, before: before[key] ?? null, after: after[key] ?? null }));
 }
 
 export function registerPackageTools(server: ToolRegistrar) {
@@ -205,14 +252,28 @@ export function registerPackageTools(server: ToolRegistrar) {
         if (changed.length === 0) return err("Nothing to change: pass at least one setting to update.");
         // getpkginfo fails for unknown packages; editpkg would silently create one.
         const current: any = await whmCall("getpkginfo", { pkg: name });
-        await whmCall(
-          "editpkg",
-          { name, ...currentPackageParams(current.pkg ?? {}), ...packageParams(fields, false) },
-          "POST"
-        );
-        return formatResponse(response_format, `Edited package ${name}: ${changed.join(", ")}.`, {
+        const before: Record<string, any> = current.pkg ?? {};
+        await whmCall("editpkg", { name, ...currentPackageParams(before), ...packageParams(fields, false) }, "POST");
+        // Re-read the package: editpkg resets anything it wasn't sent, so report settings that moved unasked.
+        let sideEffects: ReturnType<typeof unintendedChanges> | undefined;
+        try {
+          const updated: any = await whmCall("getpkginfo", { pkg: name });
+          sideEffects = unintendedChanges(before, updated.pkg ?? {}, changed);
+        } catch {
+          // The edit itself succeeded; only the check is unavailable.
+        }
+        const warning =
+          sideEffects === undefined
+            ? "\nCould not re-read the package to confirm its other settings are unchanged; check with whm_get_package."
+            : sideEffects.length
+              ? `\n⚠️ Settings you didn't ask to change also changed: ${sideEffects
+                  .map((c) => `${c.setting} (${JSON.stringify(c.before)} → ${JSON.stringify(c.after)})`)
+                  .join(", ")}. Tell the user, and restore them in WHM if they were not intended.`
+              : "";
+        return formatResponse(response_format, `Edited package ${name}: ${changed.join(", ")}.${warning}`, {
           name,
           modified: changed,
+          ...(sideEffects === undefined ? { verified: false } : { verified: true, unintended_changes: sideEffects }),
         });
       } catch (e) {
         return err(handleWhmError(e));

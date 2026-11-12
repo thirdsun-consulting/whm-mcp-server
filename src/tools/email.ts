@@ -55,8 +55,12 @@ export function registerEmailTools(server: ToolRegistrar) {
         const data: any = await whmCall("fetch_mail_queue");
         const records: any[] = data.records ?? [];
         const now = Math.floor(Date.now() / 1000);
-        const times = records.map((r) => Number(r.time)).filter((t) => t > 0);
-        const oldest = times.length ? Math.min(...times) : undefined;
+        // A loop rather than Math.min(...times): spreading a very large queue overflows the call stack.
+        let oldest: number | undefined;
+        for (const r of records) {
+          const t = Number(r.time);
+          if (t > 0 && (oldest === undefined || t < oldest)) oldest = t;
+        }
         const summary = {
           total: records.length,
           frozen: records.filter((r) => isTrue(r.frozen)).length,

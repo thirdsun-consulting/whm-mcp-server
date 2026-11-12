@@ -1,0 +1,15 @@
+{
+  "name": "thirdsun-whm",
+  "description": "The WHM Server Admin plugin for Claude Code.",
+  "owner": {
+    "name": "thirdsun-consulting"
+  },
+  "plugins": [
+    {
+      "name": "whm-mcp",
+      "source": "./plugin",
+      "description": "Administer a cPanel & WHM server through the WHM API. Starts read-only.",
+      "category": "infrastructure"
+    }
+  ]
+}
