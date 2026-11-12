@@ -1,72 +1,48 @@
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { handleWhmError, whmCall } from "../services/client.js";
-import { err, formatResponse } from "../services/format.js";
-import { FormatSchema } from "../schemas/common.js";
+import { handleWhmError, uapiCall, whmCall } from "../services/client.js";
+import { codeBlock, err, fmtTime, formatResponse, matches, pageNote, paginate } from "../services/format.js";
+import { FormatSchema, PaginationSchema } from "../schemas/common.js";
+import { ToolRegistrar } from "../types.js";
 
 /**
- * Log tailing/error reading. Critical for the user's "error monitoring" use case.
- * WHM exposes a few endpoints for this; for arbitrary log tailing, the
- * cpanel function on UAPI is more flexible — but at the WHM level we have
- * dedicated endpoints for the most useful logs.
+ * Log reading for error monitoring. WHM API 1 has no generic log tail; these
+ * tools use the documented sources: a domain's Apache error log (UAPI
+ * Stats::get_site_errors, run as the owning account) and the ModSecurity hit
+ * log. Mail delivery logs are in whm_search_mail_delivery_log, login failures
+ * in whm_get_failed_logins, and AutoSSL runs in whm_get_autossl_log.
  */
-export function registerLogTools(server: McpServer) {
+export function registerLogTools(server: ToolRegistrar) {
   server.registerTool(
-    "whm_tail_apache_error_log",
+    "whm_get_domain_error_log",
     {
-      title: "Tail Apache Error Log",
+      title: "Get Domain Error Log",
       description:
-        "Tail the global Apache error_log. THE big one for diagnosing 500 errors, mod_security blocks, PHP fatals, etc.",
+        "Read recent Apache error_log (or suexec_log) entries for a domain — the first stop for 500 errors, PHP fatals, and permission problems. " +
+        "The owning cPanel account is looked up automatically.",
       inputSchema: {
-        lines: z.number().int().min(1).max(2000).default(200).describe("Lines to tail"),
+        domain: z.string(),
+        user: z.string().optional().describe("cPanel account that owns the domain (looked up if omitted)"),
+        log: z.enum(["error", "suexec"]).default("error"),
+        maxlines: z.number().int().min(1).max(1000).default(200).describe("Log lines to retrieve"),
         ...FormatSchema,
       },
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     },
     async (params) => {
       try {
-        const data: any = await whmCall("tail_apache_error_log", { lines: params.lines });
-        const text = data.text ?? data.log ?? data.lines?.join("\n") ?? JSON.stringify(data);
-        return formatResponse(
-          params.response_format,
-          `# Apache error_log (last ${params.lines} lines)\n\`\`\`\n${text}\n\`\`\``,
-          { log: "apache_error_log", lines: params.lines, content: text }
-        );
-      } catch (e) {
-        return err(handleWhmError(e));
-      }
-    }
-  );
-
-  server.registerTool(
-    "whm_tail_exim_log",
-    {
-      title: "Tail Exim Log",
-      description: "Tail Exim's mainlog for delivery, deferral, and reject events.",
-      inputSchema: {
-        lines: z.number().int().min(1).max(2000).default(200),
-        ...FormatSchema,
-      },
-      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
-    },
-    async (params) => {
-      try {
-        // WHM doesn't have a uniform tail endpoint; we use 'cpanel' module to fetch_log
-        const data: any = await whmCall("cpanel", {
-          cpanel_jsonapi_user: "root",
-          cpanel_jsonapi_module: "Exim",
-          cpanel_jsonapi_func: "fetch_mainlog",
-          cpanel_jsonapi_apiversion: 2,
-          lines: params.lines,
+        const user = params.user ?? (await whmCall("getdomainowner", { domain: params.domain }))?.user;
+        if (!user) return err(`Couldn't find the cPanel account that owns ${params.domain}; pass 'user'.`);
+        const res = await uapiCall(user, "Stats", "get_site_errors", {
+          domain: params.domain,
+          log: params.log,
+          maxlines: params.maxlines,
         });
-        const text =
-          data?.cpanelresult?.data?.[0]?.log ??
-          data?.cpanelresult?.data?.map((r: any) => r.text).join("\n") ??
-          JSON.stringify(data);
+        const entries: any[] = res.data ?? [];
+        const text = entries.map((e) => `[${fmtTime(e.date)}] ${e.entry}`).join("\n");
         return formatResponse(
           params.response_format,
-          `# Exim mainlog (last ${params.lines})\n\`\`\`\n${text}\n\`\`\``,
-          { log: "exim_mainlog", lines: params.lines, content: text }
+          `# ${params.log}_log for ${params.domain} (${entries.length} entries)\n${entries.length ? codeBlock(text) : "No entries."}`,
+          { domain: params.domain, user, log: params.log, entries }
         );
       } catch (e) {
         return err(handleWhmError(e));
@@ -75,83 +51,45 @@ export function registerLogTools(server: McpServer) {
   );
 
   server.registerTool(
-    "whm_get_chkservd_log",
+    "whm_get_modsec_log",
     {
-      title: "Get Chkservd Log",
+      title: "Get ModSecurity Log",
       description:
-        "Fetch the chkservd log — critical for diagnosing why a service was reported down by WHM monitoring.",
+        "List recent ModSecurity (web application firewall) hits, newest first: domain, client IP, request, HTTP status, and the rule that fired. " +
+        "Use it to explain unexpected 403s or to find the rule ID to whitelist.",
       inputSchema: {
-        lines: z.number().int().min(1).max(2000).default(200),
+        host: z.string().optional().describe("Substring of the domain (vhost)"),
+        ip: z.string().optional().describe("Client IP (substring match)"),
+        rule_id: z.number().int().optional().describe("Only hits from this rule ID"),
+        ...PaginationSchema,
         ...FormatSchema,
       },
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     },
     async (params) => {
       try {
-        const data: any = await whmCall("get_chkservd_log");
-        const text = data.text ?? data.log ?? JSON.stringify(data);
-        const trimmed = text.split("\n").slice(-params.lines).join("\n");
-        return formatResponse(
-          params.response_format,
-          `# chkservd log (last ${params.lines})\n\`\`\`\n${trimmed}\n\`\`\``,
-          { log: "chkservd", lines: params.lines, content: trimmed }
-        );
-      } catch (e) {
-        return err(handleWhmError(e));
-      }
-    }
-  );
-
-  server.registerTool(
-    "whm_get_login_history",
-    {
-      title: "Get WHM Login History",
-      description: "Get the login history for the WHM control panel — root and reseller logins.",
-      inputSchema: { ...FormatSchema },
-      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
-    },
-    async (params) => {
-      try {
-        const data: any = await whmCall("get_login_history");
-        const events = data.history ?? data.login_history ?? [];
-        const md = [
-          `# WHM login history (${events.length})`,
-          ...events.slice(0, 50).map(
-            (e: any) =>
-              `- ${e.date ?? e.time ?? ""} — ${e.user ?? "?"} from ${e.host ?? e.ip ?? "?"} (${e.status ?? "?"})`
-          ),
-        ].join("\n");
-        return formatResponse(params.response_format, md, data);
-      } catch (e) {
-        return err(handleWhmError(e));
-      }
-    }
-  );
-
-  server.registerTool(
-    "whm_get_audit_log",
-    {
-      title: "Get WHM Audit Log",
-      description:
-        "Get the audit log of WHM administrative actions (account creation/removal, package changes, etc.).",
-      inputSchema: {
-        days: z.number().int().min(1).max(365).default(7),
-        ...FormatSchema,
-      },
-      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
-    },
-    async (params) => {
-      try {
-        const data: any = await whmCall("get_audit_log", { days: params.days });
-        const items = data.items ?? data.entries ?? data.log ?? [];
-        const md = [
-          `# WHM audit log (last ${params.days} days)`,
-          ...(Array.isArray(items) ? items : []).slice(0, 100).map(
-            (e: any) =>
-              `- ${e.date ?? e.timestamp ?? ""} — ${e.username ?? e.user ?? "?"} did **${e.action ?? e.event ?? "?"}** (${e.target ?? ""})`
-          ),
-        ].join("\n");
-        return formatResponse(params.response_format, md, data);
+        const data: any = await whmCall("modsec_get_log");
+        const hits = (Array.isArray(data) ? data : [])
+          .filter(
+            (h: any) =>
+              matches(h.host, params.host) &&
+              matches(h.ip, params.ip) &&
+              (params.rule_id === undefined || Number(h.meta_id) === params.rule_id)
+          )
+          .sort((a: any, b: any) => (Number(b.id) || 0) - (Number(a.id) || 0));
+        const page = paginate<any>(hits, params.limit, params.offset);
+        const md =
+          [
+            `# ModSecurity hits (${page.total})`,
+            ...page.items.map(
+              (h) =>
+                `- ${h.timestamp} ${h.host} ${h.ip} ${h.http_method ?? ""} ${h.meta_uri || h.path || ""} → ${h.http_status ?? "?"} — rule ${
+                  h.meta_id ?? "?"
+                }: ${h.meta_msg ?? "n/a"}${h.meta_severity ? ` [${h.meta_severity}]` : ""}`
+            ),
+          ].join("\n") + pageNote(page);
+        const { items, ...meta } = page;
+        return formatResponse(params.response_format, md, { ...meta, hits: items });
       } catch (e) {
         return err(handleWhmError(e));
       }

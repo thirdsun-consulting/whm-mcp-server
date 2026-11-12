@@ -1,7 +1,7 @@
 {
   "name": "whm-mcp-server",
-  "version": "0.1.0",
-  "description": "MCP server for WHM (WebHost Manager) API v1 — server-level cPanel administration: accounts, services, DNS, email, logs, packages, SSL",
+  "version": "0.2.0",
+  "description": "MCP server for the WHM (WebHost Manager) API 1 — server-level cPanel administration: accounts, domains, DNS, email, packages, SSL/AutoSSL, backups, resellers, cPHulk, PHP, logs",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
@@ -12,7 +12,9 @@
     "dev": "tsx watch src/index.ts",
     "build": "tsc && chmod +x dist/index.js",
     "clean": "rm -rf dist",
-    "inspect": "npx @modelcontextprotocol/inspector node dist/index.js"
+    "inspect": "npx @modelcontextprotocol/inspector node dist/index.js",
+    "verify:spec": "node scripts/verify-spec.mjs",
+    "verify:http": "node scripts/verify-http.mjs"
   },
   "engines": {
     "node": ">=18"
